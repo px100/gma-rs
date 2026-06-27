@@ -1,0 +1,10 @@
+target/
+.DS_Store
+*.log
+*.sav
+*.srm
+*.state
+*.gba
+*.agb
+gba_bios.bin
+bios*.bin
