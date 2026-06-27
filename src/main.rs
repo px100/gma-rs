@@ -2177,6 +2177,10 @@ pub mod bus {
       pub bldalpha: u16,
       pub bldy: u16,
       pub sound_regs: Vec<u8>,
+      pub siomulti: [u16; 4],
+      pub siocnt: u16,
+      pub siomlt_send: u16,
+      pub rcnt: u16,
       pub waitcnt: u16,
       pub postflg: u8,
       pub haltcnt: u8,
@@ -2206,6 +2210,10 @@ pub mod bus {
           bldalpha: 0,
           bldy: 0,
           sound_regs: vec![0; 0x50],
+          siomulti: [0; 4],
+          siocnt: 0,
+          siomlt_send: 0,
+          rcnt: 0,
           waitcnt: 0,
           postflg: 0,
           haltcnt: 0,
@@ -2242,6 +2250,10 @@ pub mod bus {
         };
         *latch = (*latch & 0xFFFF) | ((val as i32) << 16);
         *latch = Self::sign_extend_28(*latch as u32);
+      }
+
+      pub fn write_siocnt_no_cable(&mut self, val: u16) {
+        self.siocnt = (val & !0x0080) | 0x000C;
       }
     }
   }
@@ -2838,6 +2850,13 @@ pub mod bus {
         0x10A => self.timers.timers[2].control,
         0x10C => self.timers.read_counter(3),
         0x10E => self.timers.timers[3].control,
+        0x120 => self.io.siomulti[0],
+        0x122 => self.io.siomulti[1],
+        0x124 => self.io.siomulti[2],
+        0x126 => self.io.siomulti[3],
+        0x128 => self.io.siocnt,
+        0x12A => self.io.siomlt_send,
+        0x134 => self.io.rcnt,
         0x130 => self.keypad.read_keyinput(),
         0x132 => self.keypad.keycnt,
         0x200 => self.interrupt.read_ie(),
@@ -3003,7 +3022,19 @@ pub mod bus {
         0x10A => self.timers.write_control(2, val),
         0x10C => self.timers.write_reload(3, val),
         0x10E => self.timers.write_control(3, val),
+        0x120 => self.io.siomulti[0] = val,
+        0x122 => self.io.siomulti[1] = val,
+        0x124 => self.io.siomulti[2] = val,
+        0x126 => self.io.siomulti[3] = val,
+        0x128 => {
+          self.io.write_siocnt_no_cable(val);
+          if val & 0x4080 == 0x4080 {
+            self.interrupt.request_irq(crate::interrupt::Irq::Serial);
+          }
+        }
+        0x12A => self.io.siomlt_send = val,
         0x132 => self.keypad.keycnt = val,
+        0x134 => self.io.rcnt = val,
         0x200 => self.interrupt.write_ie(val),
         0x202 => self.interrupt.write_if(val),
         0x208 => self.interrupt.write_ime(val),
@@ -6808,7 +6839,10 @@ pub mod bios {
     let dst = cpu.regs[1];
     let header = bus.read32(src);
     let data_size = header >> 8;
-    let bit_length = (header >> 4) & 0xF;
+    let bit_length = header & 0xF;
+    if bit_length == 0 || bit_length > 8 {
+      return;
+    }
     let tree_size = (bus.read8(src + 4) as u32 + 1) * 2;
     let tree_start = src + 5;
     let data_start = tree_start + tree_size - 1;
@@ -6818,6 +6852,7 @@ pub mod bios {
     let mut remaining = data_size;
     let mut dst_buffer = 0u32;
     let mut dst_bits = 0u32;
+    let mut node_addr = tree_start;
     while remaining > 0 {
       let data_word = bus.read32(src_pos);
       src_pos += 4;
@@ -6826,39 +6861,27 @@ pub mod bios {
           break;
         }
         let bit = (data_word >> bit_idx) & 1;
-        let mut node_addr = tree_start;
         let node = bus.read8(node_addr);
-        let child_offset = (node & 0x3F) as u32;
-        let is_leaf_0 = node & 0x80 != 0;
-        let is_leaf_1 = node & 0x40 != 0;
-        if bit == 0 {
-          node_addr += (child_offset + 1) * 2;
-          if is_leaf_0 {
-            let leaf_val = bus.read8(node_addr) as u32;
-            dst_buffer |= leaf_val << dst_bits;
-            dst_bits += bit_length;
-            if dst_bits >= 32 {
-              bus.write32(dst_pos, dst_buffer);
-              dst_pos += 4;
-              remaining = remaining.saturating_sub(4);
-              dst_buffer = 0;
-              dst_bits = 0;
-            }
+        let child_addr = (node_addr & !1) + ((node & 0x3F) as u32) * 2 + 2 + bit;
+        let is_leaf = if bit == 0 {
+          node & 0x80 != 0
+        } else {
+          node & 0x40 != 0
+        };
+        if is_leaf {
+          let leaf_val = bus.read8(child_addr) as u32;
+          dst_buffer |= leaf_val << dst_bits;
+          dst_bits += bit_length;
+          node_addr = tree_start;
+          if dst_bits >= 32 {
+            bus.write32(dst_pos, dst_buffer);
+            dst_pos += 4;
+            remaining = remaining.saturating_sub(4);
+            dst_buffer = 0;
+            dst_bits = 0;
           }
         } else {
-          node_addr += (child_offset + 1) * 2 + 1;
-          if is_leaf_1 {
-            let leaf_val = bus.read8(node_addr) as u32;
-            dst_buffer |= leaf_val << dst_bits;
-            dst_bits += bit_length;
-            if dst_bits >= 32 {
-              bus.write32(dst_pos, dst_buffer);
-              dst_pos += 4;
-              remaining = remaining.saturating_sub(4);
-              dst_buffer = 0;
-              dst_bits = 0;
-            }
-          }
+          node_addr = child_addr;
         }
       }
     }
@@ -7000,6 +7023,38 @@ pub mod bios {
       for i in 0..8u32 {
         assert_eq!(bus.read8(dst + i), (i + 1) as u8);
       }
+    }
+
+    #[test]
+    fn huffman_walks_child_nodes_until_leaf() {
+      let (mut cpu, mut bus) = make_cpu_bus();
+      let src = 0x0200_0000u32;
+      let dst = 0x0200_1000u32;
+      bus.write32(src, (4 << 8) | (2 << 4) | 8);
+      bus.write8(src + 4, 3);
+      bus.write8(src + 5, 0x80);
+      bus.write8(src + 6, b'f');
+      bus.write8(src + 7, 0xC0);
+      bus.write8(src + 8, b'H');
+      bus.write8(src + 9, b'u');
+      bus.write32(src + 12, 0xB000_0000);
+      cpu.regs[0] = src;
+      cpu.regs[1] = dst;
+      swi_huffman_uncomp(&mut cpu, &mut bus);
+      assert_eq!(bus.read32(dst), u32::from_le_bytes(*b"Huff"));
+    }
+
+    #[test]
+    fn huffman_invalid_bit_width_returns() {
+      let (mut cpu, mut bus) = make_cpu_bus();
+      let src = 0x0200_0000u32;
+      let dst = 0x0200_1000u32;
+      bus.write32(src, (4 << 8) | (2 << 4));
+      bus.write32(dst, 0xA5A5_A5A5);
+      cpu.regs[0] = src;
+      cpu.regs[1] = dst;
+      swi_huffman_uncomp(&mut cpu, &mut bus);
+      assert_eq!(bus.read32(dst), 0xA5A5_A5A5);
     }
 
     #[test]
@@ -8588,6 +8643,15 @@ mod tests {
   }
 
   #[test]
+  fn sio_no_cable_clears_start_and_reports_status() {
+    let mut gba = Gba::new(None, make_loop_rom());
+    gba.bus.write16(0x0400_012A, 0xFEFE);
+    gba.bus.write16(0x0400_0128, 0x6083);
+    assert_eq!(gba.bus.read16(0x0400_012A), 0xFEFE);
+    assert_eq!(gba.bus.read16(0x0400_0128), 0x600F);
+  }
+
+  #[test]
   fn test_mode3_pixel_write() {
     let rom = make_mode3_test_rom();
     let mut gba = Gba::new(None, rom);
@@ -9345,6 +9409,27 @@ fn print_help() {
   );
 }
 
+fn load_bios_arg(args: &Args) -> Option<Vec<u8>> {
+  if args.skip_bios {
+    return None;
+  }
+  args.bios.as_ref().map(|path| {
+    let data = fs::read(path).unwrap_or_else(|e| {
+      eprintln!("Failed to read BIOS '{}': {}", path, e);
+      std::process::exit(1);
+    });
+    if data.len() != 0x4000 {
+      eprintln!(
+        "Invalid BIOS '{}': expected 16384 bytes, got {}. Extract gba_bios.bin from the zip first.",
+        path,
+        data.len()
+      );
+      std::process::exit(2);
+    }
+    data
+  })
+}
+
 fn sav_path(rom_path: &str) -> PathBuf {
   let p = Path::new(rom_path);
   p.with_extension("sav")
@@ -9441,12 +9526,7 @@ fn load_state(gba: &mut Gba, path: &Path) {
 
 fn main() {
   let args = Args::parse();
-  let bios = args.bios.as_ref().map(|path| {
-    fs::read(path).unwrap_or_else(|e| {
-      eprintln!("Failed to read BIOS '{}': {}", path, e);
-      std::process::exit(1);
-    })
-  });
+  let bios = load_bios_arg(&args);
   if args.harness {
     harness::run(bios, args.skip_bios);
     return;
