@@ -2682,6 +2682,12 @@ pub mod bus {
         (channel_id == 1 || channel_id == 2) && ch.timing_mode() == crate::dma::DmaTiming::Special;
       let mut src = ch.internal_sad;
       let mut dst = ch.internal_dad;
+      if !word32
+        && self.is_eeprom_region(dst)
+        && let BackupMedia::Eeprom(e) = &mut self.backup
+      {
+        e.hint_transfer_bits(count);
+      }
       if is_fifo {
         for _ in 0..4 {
           let val = self.read32(src);
@@ -6182,6 +6188,27 @@ pub mod backup {
         }
       }
 
+      pub fn hint_transfer_bits(&mut self, bits: u32) {
+        match bits {
+          9 | 73 => self.set_size(SizeKind::Small),
+          17 | 81 => self.set_size(SizeKind::Large),
+          _ => {}
+        }
+      }
+
+      fn set_size(&mut self, size: SizeKind) {
+        let (bytes, width) = match size {
+          SizeKind::Small => (512, 6),
+          SizeKind::Large => (8 * 1024, 14),
+          SizeKind::Unknown => return,
+        };
+        if self.data.len() != bytes {
+          self.data.resize(bytes, 0xFF);
+        }
+        self.size = size;
+        self.addr_width = width;
+      }
+
       pub fn peek(&self, _addr: u32) -> u8 {
         match self.state {
           State::ReadOut if self.read_bits_left > 64 => 0,
@@ -6317,8 +6344,7 @@ pub mod backup {
       #[test]
       fn test_eeprom_write_read_small() {
         let mut eeprom = Eeprom::new();
-        eeprom.size = SizeKind::Small;
-        eeprom.addr_width = 6;
+        eeprom.set_size(SizeKind::Small);
         let data: u64 = 0x0102030405060708;
         send_bits(&mut eeprom, 0b10, 2);
         send_bits(&mut eeprom, 0, 6);
@@ -6337,8 +6363,7 @@ pub mod backup {
       #[test]
       fn test_eeprom_write_done_ready() {
         let mut eeprom = Eeprom::new();
-        eeprom.size = SizeKind::Small;
-        eeprom.addr_width = 6;
+        eeprom.set_size(SizeKind::Small);
         send_bits(&mut eeprom, 0b10, 2);
         send_bits(&mut eeprom, 0, 6);
         send_bits(&mut eeprom, 0xAAAAAAAAAAAAAAAA, 64);
@@ -6349,8 +6374,7 @@ pub mod backup {
       #[test]
       fn eeprom_write_preserves_first_data_bit() {
         let mut eeprom = Eeprom::new();
-        eeprom.size = SizeKind::Small;
-        eeprom.addr_width = 6;
+        eeprom.set_size(SizeKind::Small);
         send_bits(&mut eeprom, 0b10, 2);
         send_bits(&mut eeprom, 0, 6);
         send_bits(&mut eeprom, 0xFEDC_BA98_7654_3210, 64);
@@ -6361,8 +6385,7 @@ pub mod backup {
       #[test]
       fn eeprom_readout_advances_on_reads() {
         let mut eeprom = Eeprom::new();
-        eeprom.size = SizeKind::Small;
-        eeprom.addr_width = 6;
+        eeprom.set_size(SizeKind::Small);
         eeprom.data[..8].copy_from_slice(&0x8000_0000_0000_0001u64.to_be_bytes());
         send_bits(&mut eeprom, 0b11, 2);
         send_bits(&mut eeprom, 0, 6);
@@ -6373,6 +6396,17 @@ pub mod backup {
         }
         assert_eq!(bits >> 64, 0);
         assert_eq!(bits as u64, 0x8000_0000_0000_0001);
+      }
+
+      #[test]
+      fn eeprom_dma_transfer_size_hint_selects_capacity() {
+        let mut eeprom = Eeprom::new();
+        eeprom.hint_transfer_bits(9);
+        assert_eq!(eeprom.data.len(), 512);
+        assert_eq!(eeprom.effective_addr_width(), 6);
+        eeprom.hint_transfer_bits(17);
+        assert_eq!(eeprom.data.len(), 8 * 1024);
+        assert_eq!(eeprom.effective_addr_width(), 14);
       }
     }
   }
@@ -8643,6 +8677,21 @@ mod tests {
   }
 
   #[test]
+  fn eeprom_dma_hint_can_downshift_loaded_large_save() {
+    let mut rom = vec![0u8; 8 * 1024 * 1024];
+    rom.extend_from_slice(b"EEPROM_V124");
+    let mut gba = Gba::new(None, rom);
+    gba.load_save_bytes(&vec![0xAA; 8 * 1024]);
+    gba.bus.write16(0x0200_0000, 0);
+    gba.bus.dma.channels[3].sad = 0x0200_0000;
+    gba.bus.dma.channels[3].dad = 0x0D00_0000;
+    gba.bus.dma.channels[3].count = 9;
+    assert_eq!(gba.bus.write_dma_control(3, 1 << 15), Some(3));
+    gba.bus.run_dma(3);
+    assert_eq!(gba.save_bytes().unwrap().len(), 512);
+  }
+
+  #[test]
   fn sio_no_cable_clears_start_and_reports_status() {
     let mut gba = Gba::new(None, make_loop_rom());
     gba.bus.write16(0x0400_012A, 0xFEFE);
@@ -8981,44 +9030,89 @@ mod audio {
 mod input {
   use crate::keypad::*;
   use sdl2::keyboard::{KeyboardState, Scancode};
-  pub fn read_keyboard(keyboard: &KeyboardState) -> u16 {
+
+  fn pressed_any(mut down: impl FnMut(Scancode) -> bool, keys: &[Scancode]) -> bool {
+    keys.iter().any(|&key| down(key))
+  }
+
+  pub fn map_keyboard(mut down: impl FnMut(Scancode) -> bool) -> u16 {
     let mut keys = 0u16;
-    if keyboard.is_scancode_pressed(Scancode::Z) {
+    if pressed_any(&mut down, &[Scancode::Z, Scancode::J]) {
       keys |= KEY_A;
     }
-    if keyboard.is_scancode_pressed(Scancode::X) {
+    if pressed_any(&mut down, &[Scancode::X, Scancode::K]) {
       keys |= KEY_B;
     }
-    if keyboard.is_scancode_pressed(Scancode::Return)
-      || keyboard.is_scancode_pressed(Scancode::KpEnter)
-      || keyboard.is_scancode_pressed(Scancode::Space)
-    {
+    if pressed_any(
+      &mut down,
+      &[Scancode::Return, Scancode::KpEnter, Scancode::Space],
+    ) {
       keys |= KEY_START;
     }
-    if keyboard.is_scancode_pressed(Scancode::Backspace)
-      || keyboard.is_scancode_pressed(Scancode::Tab)
-    {
+    if pressed_any(
+      &mut down,
+      &[
+        Scancode::Backspace,
+        Scancode::Tab,
+        Scancode::LShift,
+        Scancode::RShift,
+      ],
+    ) {
       keys |= KEY_SELECT;
     }
-    if keyboard.is_scancode_pressed(Scancode::Right) {
+    if pressed_any(&mut down, &[Scancode::Right, Scancode::D]) {
       keys |= KEY_RIGHT;
     }
-    if keyboard.is_scancode_pressed(Scancode::Left) {
+    if pressed_any(&mut down, &[Scancode::Left, Scancode::A]) {
       keys |= KEY_LEFT;
     }
-    if keyboard.is_scancode_pressed(Scancode::Up) {
+    if pressed_any(&mut down, &[Scancode::Up, Scancode::W]) {
       keys |= KEY_UP;
     }
-    if keyboard.is_scancode_pressed(Scancode::Down) {
+    if pressed_any(&mut down, &[Scancode::Down, Scancode::S]) {
       keys |= KEY_DOWN;
     }
-    if keyboard.is_scancode_pressed(Scancode::A) {
+    if pressed_any(&mut down, &[Scancode::Q]) {
       keys |= KEY_L;
     }
-    if keyboard.is_scancode_pressed(Scancode::S) {
+    if pressed_any(&mut down, &[Scancode::E]) {
       keys |= KEY_R;
     }
     keys
+  }
+
+  pub fn read_keyboard(keyboard: &KeyboardState) -> u16 {
+    map_keyboard(|key| keyboard.is_scancode_pressed(key))
+  }
+
+  #[cfg(test)]
+  mod tests {
+    use super::*;
+
+    fn keys(active: &[Scancode]) -> u16 {
+      map_keyboard(|key| active.contains(&key))
+    }
+
+    #[test]
+    fn arrows_and_wasd_map_to_dpad() {
+      assert_eq!(keys(&[Scancode::Left, Scancode::W]), KEY_LEFT | KEY_UP);
+      assert_eq!(keys(&[Scancode::A, Scancode::S]), KEY_LEFT | KEY_DOWN);
+    }
+
+    #[test]
+    fn face_start_select_and_shoulders_have_alternates() {
+      assert_eq!(
+        keys(&[
+          Scancode::J,
+          Scancode::K,
+          Scancode::Space,
+          Scancode::LShift,
+          Scancode::Q,
+          Scancode::E,
+        ]),
+        KEY_A | KEY_B | KEY_START | KEY_SELECT | KEY_L | KEY_R
+      );
+    }
   }
 }
 
@@ -9113,6 +9207,7 @@ mod harness {
         "step" => self.step(req),
         "get_video" => self.get_video(),
         "get_audio" => self.get_audio(),
+        "get_save" => self.get_save(),
         "save_state" => self.serialize_state(),
         "load_state" => wrap(self.deserialize_state(blob)),
         "peek" => self.peek(req),
@@ -9255,6 +9350,13 @@ mod harness {
           "nsamples": nsamples,
       });
       (hdr, blob, false)
+    }
+
+    fn get_save(&self) -> (Value, Vec<u8>, bool) {
+      match self.gba.as_ref().and_then(Gba::save_bytes) {
+        Some(data) => (json!({"ok": true, "len": data.len()}), data, false),
+        None => (json!({"ok": true, "len": 0}), vec![], false),
+      }
     }
 
     fn serialize_state(&mut self) -> (Value, Vec<u8>, bool) {

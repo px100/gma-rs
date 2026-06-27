@@ -43,6 +43,18 @@ Example:
 cargo run --release -- path/to/game.gba --bios path/to/gba_bios.bin --scale 4
 ```
 
+Controls:
+
+```text
+D-pad: Arrow keys or W/A/S/D
+A/B: Z/X or J/K
+Start: Enter or Space
+Select: Tab, Backspace, or Shift
+L/R: Q/E
+Save state: ]
+Load state: [
+```
+
 Save files are loaded from and written beside the ROM.
 
 ## Test
